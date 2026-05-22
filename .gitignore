@@ -1,0 +1,4 @@
+/target
+ferrum.db
+*.db
+Cargo.lock
