@@ -1,6 +1,10 @@
+use std::time;
+use std::time::SystemTime;
 use anyhow::Result;
 use sqlx::SqlitePool;
+use serde::Deserialize;
 
+#[derive(Clone)]
 pub struct PacketRecord {
     pub src_ip: String,
     pub dst_ip: String,
@@ -11,6 +15,18 @@ pub struct PacketRecord {
     pub length: u16,
 }
 
+#[derive(Deserialize)]
+pub struct IpApiResponse {
+    #[serde(rename = "org")]
+    org: Option<String>,
+
+    country: Option<String>,
+
+    #[serde(rename = "query")]
+    ip: String,
+}
+
+#[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
 }
@@ -35,6 +51,23 @@ impl Store {
                 packet_length    INTEGER NOT NULL,
                 captured_at      INTEGER NOT NULL
             )",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ip_intelligence (
+                    ip           TEXT PRIMARY KEY,
+                    org_name     TEXT,
+                    country      TEXT,
+                    network      TEXT,
+                    asn          TEXT,
+                    description  TEXT,
+                    looked_up_at INTEGER NOT NULL,
+                    first_seen   INTEGER NOT NULL,
+                    last_seen    INTEGER NOT NULL,
+                    hit_count    INTEGER NOT NULL DEFAULT 0
+                )"
         )
         .execute(&pool)
         .await?;
@@ -80,5 +113,67 @@ impl Store {
             .await?;
 
         Ok(result.rows_affected())
+    }
+
+    pub async fn lookup_ip(&self, ip: &str) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        // Check cache first
+        let cached = sqlx::query("
+            SELECT looked_up_at FROM ip_intelligence
+            WHERE ip = ? AND looked_up_at > ?"
+        )
+        .bind(ip)
+        .bind(now - (7 *86400))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if cached.is_some() {
+            // Cache hit - just update the hit count and last_seen
+            sqlx::query("
+                UPDATE ip_intelligence
+                SET hit_count = hit_count + 1,
+                    last_seen = ?
+                WHERE ip = ?
+            ")
+            .bind(now)
+            .bind(ip)
+            .execute(&self.pool)
+            .await?;
+
+            return Ok(())
+        }
+
+        // cache miss — hit the API
+        let url = format!("http://ip-api.com/json/{}", ip);
+        let response = reqwest::get(&url)
+            .await?
+            .json::<IpApiResponse>()
+            .await?;
+
+        // upsert — insert or update if exists
+        sqlx::query(
+            "INSERT INTO ip_intelligence
+         (ip, org_name, country, looked_up_at, first_seen, last_seen, hit_count)
+         VALUES (?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(ip) DO UPDATE SET
+             org_name     = excluded.org_name,
+             country      = excluded.country,
+             looked_up_at = excluded.looked_up_at,
+             last_seen    = excluded.last_seen,
+             hit_count    = hit_count + 1"
+        )
+            .bind(&response.ip)
+            .bind(&response.org)
+            .bind(&response.country)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
 }

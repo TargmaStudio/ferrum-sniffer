@@ -2,3 +2,6 @@
 ferrum.db
 *.db
 Cargo.lock
+
+*.db-shm
+*.db-wal
