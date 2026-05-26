@@ -116,6 +116,10 @@ impl Store {
     }
 
     pub async fn lookup_ip(&self, ip: &str) -> Result<()> {
+        if is_private_ip(ip) {
+            return Ok(());
+        }
+
         let now = SystemTime::now()
             .duration_since(time::UNIX_EPOCH)?
             .as_secs() as i64;
@@ -175,5 +179,25 @@ impl Store {
             .await?;
 
         Ok(())
+    }
+}
+
+fn is_private_ip(ip: &str) -> bool {
+    ip.starts_with("192.168.")
+    || ip.starts_with("10.")
+    || ip.starts_with("127.")
+    || ip.starts_with("169.254.")
+    || ip.starts_with("::1")
+    || {
+        // 172.16.0.0 - 172.31.255.255
+        if let Some(second) = ip.strip_prefix("172.") {
+            if let Some(num) = second.split(".").next() {
+                if let Ok(n) = num.parse::<u8>() {
+                    return n >= 16 && n <= 31;
+                }
+            }
+        }
+
+        false
     }
 }
