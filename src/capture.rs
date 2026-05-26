@@ -1,15 +1,19 @@
-use std::collections::HashSet;
-use anyhow::{Context, Result};
-use pcap::{Capture, Device};
-use tokio::task::{JoinSet};
 use crate::db::store::{PacketRecord, Store};
+use crate::detector::arp::{ArpDetector, ArpEvent};
 use crate::detector::syn;
-use crate::parser::{ethernet, ipv4::{Ipv4Packet, Protocol}};
 use crate::parser::arp::ArpHeader;
 use crate::parser::icmp::IcmpHeader;
-use crate::parser::tcp::{TcpHeader};
+use crate::parser::tcp::{TcpFlags, TcpHeader};
 use crate::parser::udp::UdpHeader;
-use crate::detector::arp::{ArpDetector, ArpEvent};
+use crate::parser::{
+    ethernet,
+    ipv4::{Ipv4Packet, Protocol},
+};
+use anyhow::{Context, Result};
+use pcap::{Capture, Device};
+use std::collections::HashSet;
+use tokio::task::JoinSet;
+use tokio::time::{timeout, Duration};
 
 pub fn list_interfaces() -> Result<()> {
     let devices = get_devices()?;
@@ -46,8 +50,7 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
         .timeout(1000)
         .open()
         .context("Failed to open interface")?;
-    cap.filter(filter, true)
-        .context("Failed to filter")?;
+    cap.filter(filter, true).context("Failed to filter")?;
 
     let mut detector = syn::SynDetector::new();
     let mut arp_detector = ArpDetector::new();
@@ -62,6 +65,8 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                         if let Some(ip) = Ipv4Packet::parse(&packet.data[14..]) {
                             let ip_header_len = ip.header_length as usize;
                             let transport = &packet.data[14 + ip_header_len..];
+                            let src = Ipv4Packet::format_ip(&ip.source);
+                            let dst = Ipv4Packet::format_ip(&ip.destination);
 
                             match ip.protocol {
                                 Protocol::TCP => {
@@ -76,16 +81,9 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                                             dst_port: tcp.dst_port,
                                             protocol: "TCP".to_string(),
                                             flags: Some(format_flags(&tcp.flags)),
-                                            length: transport.len() as u16
+                                            length: transport.len() as u16,
                                         };
                                         store.insert_packet(&record).await?;
-                                        let src = Ipv4Packet::format_ip(&ip.source);
-                                        let dst = Ipv4Packet::format_ip(&ip.destination);
-                                        let src_new = seen_ips.insert(src.clone());
-                                        let dst_new = seen_ips.insert(dst.clone());
-                                        if src_new || dst_new {
-                                            spawn_ip_lookup(&mut tasks, &store, src, dst);
-                                        }
 
                                         println!(
                                             "#{} {}:{} -> {}:{} [{}] seq={} ack={} win={}",
@@ -100,26 +98,19 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                                             tcp.window_size
                                         );
                                     }
-                                },
+                                }
                                 Protocol::UDP => {
                                     if let Some(udp) = UdpHeader::parse(transport) {
                                         let record = PacketRecord {
-                                            src_ip:   Ipv4Packet::format_ip(&ip.source),
-                                            dst_ip:   Ipv4Packet::format_ip(&ip.destination),
+                                            src_ip: Ipv4Packet::format_ip(&ip.source),
+                                            dst_ip: Ipv4Packet::format_ip(&ip.destination),
                                             src_port: udp.src_port,
                                             dst_port: udp.dst_port,
                                             protocol: "UDP".to_string(),
-                                            flags:    None,
-                                            length:   udp.length,
+                                            flags: None,
+                                            length: udp.length,
                                         };
                                         store.insert_packet(&record).await?;
-                                        let src = Ipv4Packet::format_ip(&ip.source);
-                                        let dst = Ipv4Packet::format_ip(&ip.destination);
-                                        let src_new = seen_ips.insert(src.clone());
-                                        let dst_new = seen_ips.insert(dst.clone());
-                                        if src_new || dst_new {
-                                            spawn_ip_lookup(&mut tasks, &store, src, dst);
-                                        }
 
                                         println!(
                                             "#{} {}:{} -> {}:{} [UDP] len={}",
@@ -131,37 +122,35 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                                             udp.length
                                         );
                                     }
-                                },
+                                }
                                 Protocol::ICMP => {
-                                  if let Some(icmp) = IcmpHeader::parse(transport) {
-                                      let icmp_desc = match icmp.icmp_type {
-                                          8 => "Echo Request (ping)",
-                                          0 => "Echo Reply",
-                                          11 => "Time Exceeded (traceroute)",
-                                          3 => "Destination Unreachable",
-                                          _ => "unknown ICMP type",
-                                      };
+                                    if let Some(icmp) = IcmpHeader::parse(transport) {
+                                        let icmp_desc = match icmp.icmp_type {
+                                            8 => "Echo Request (ping)",
+                                            0 => "Echo Reply",
+                                            11 => "Time Exceeded (traceroute)",
+                                            3 => "Destination Unreachable",
+                                            _ => "unknown ICMP type",
+                                        };
 
-                                      println!(
-                                          "#{} {} -> {} [ICMP] type={} ({}) code={}",
-                                          packet_number,
-                                          Ipv4Packet::format_ip(&ip.source),
-                                          Ipv4Packet::format_ip(&ip.destination),
-                                          icmp.icmp_type,
-                                          icmp_desc,
-                                          icmp.code,
-                                      );
-
-                                      let src = Ipv4Packet::format_ip(&ip.source);
-                                      let dst = Ipv4Packet::format_ip(&ip.destination);
-                                      let src_new = seen_ips.insert(src.clone());
-                                      let dst_new = seen_ips.insert(dst.clone());
-                                      if src_new || dst_new {
-                                          spawn_ip_lookup(&mut tasks, &store, src, dst);
-                                      }
-                                  }
-                                },
+                                        println!(
+                                            "#{} {} -> {} [ICMP] type={} ({}) code={}",
+                                            packet_number,
+                                            Ipv4Packet::format_ip(&ip.source),
+                                            Ipv4Packet::format_ip(&ip.destination),
+                                            icmp.icmp_type,
+                                            icmp_desc,
+                                            icmp.code,
+                                        );
+                                    }
+                                }
                                 _ => {}
+                            }
+
+                            let src_new = seen_ips.insert(src.clone());
+                            let dst_new = seen_ips.insert(dst.clone());
+                            if src_new || dst_new {
+                                spawn_ip_lookup(&mut tasks, &store, src, dst);
                             }
                         }
                     }
@@ -170,22 +159,26 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                     if frame.ether_type == 0x0806 {
                         if let Some(arp) = ArpHeader::parse(&packet.data[14..]) {
                             match arp_detector.analyze(&arp.sender_ip, &arp.sender_mac) {
-                                ArpEvent::PoisoningDetected { ip, known_mac, spoofed_mac } => {
+                                ArpEvent::PoisoningDetected {
+                                    ip,
+                                    known_mac,
+                                    spoofed_mac,
+                                } => {
                                     println!(
                                         "⚠️  ARP POISONING DETECTED!\n    IP:  {}\n    Was: {}\n    Now: {}",
                                         Ipv4Packet::format_ip(&ip),
                                         ethernet::format_mac(&known_mac),
                                         ethernet::format_mac(&spoofed_mac)
                                     );
-                                },
-                                ArpEvent::NewMapping => {},
-                                ArpEvent::MacUpdated => {},
+                                }
+                                ArpEvent::NewMapping => {}
+                                ArpEvent::MacUpdated => {}
                             }
 
                             let op = match arp.operation {
                                 1 => "REQUEST",
                                 2 => "REPLY",
-                                _ => "UNKNOWN"
+                                _ => "UNKNOWN",
                             };
 
                             println!(
@@ -221,7 +214,12 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
         }
     }
 
-    while let Some(_) = tasks.join_next().await {}
+    let _ = timeout(
+        Duration::from_secs(5),
+        async {
+            while let Some(_) = tasks.join_next().await {}
+        }
+    ).await;
 
     Ok(())
 }
@@ -230,23 +228,30 @@ fn get_devices() -> Result<Vec<Device>> {
     Device::list().context("Failed to list network devices")
 }
 
-fn format_flags(flags: &crate::parser::tcp::TcpFlags) -> String {
+fn format_flags(flags: &TcpFlags) -> String {
     let mut f = Vec::new();
-    if flags.contains(crate::parser::tcp::TcpFlags::SYN) { f.push("SYN"); }
-    if flags.contains(crate::parser::tcp::TcpFlags::ACK) { f.push("ACK"); }
-    if flags.contains(crate::parser::tcp::TcpFlags::FIN) { f.push("FIN"); }
-    if flags.contains(crate::parser::tcp::TcpFlags::RST) { f.push("RST"); }
-    if flags.contains(crate::parser::tcp::TcpFlags::PSH) { f.push("PSH"); }
-    if flags.contains(crate::parser::tcp::TcpFlags::URG) { f.push("URG"); }
+    if flags.contains(TcpFlags::SYN) {
+        f.push("SYN");
+    }
+    if flags.contains(TcpFlags::ACK) {
+        f.push("ACK");
+    }
+    if flags.contains(TcpFlags::FIN) {
+        f.push("FIN");
+    }
+    if flags.contains(TcpFlags::RST) {
+        f.push("RST");
+    }
+    if flags.contains(TcpFlags::PSH) {
+        f.push("PSH");
+    }
+    if flags.contains(TcpFlags::URG) {
+        f.push("URG");
+    }
     f.join("|")
 }
 
-fn spawn_ip_lookup(
-    tasks: &mut JoinSet<()>,
-    store: &Store,
-    src: String,
-    dst: String,
-) {
+fn spawn_ip_lookup(tasks: &mut JoinSet<()>, store: &Store, src: String, dst: String) {
     let store_clone = store.clone();
     tasks.spawn(async move {
         let _ = store_clone.lookup_ip(&src).await;

@@ -163,7 +163,7 @@ impl Store {
             None => (None, None),
         };
 
-        let result = sqlx::query(
+        sqlx::query(
             "INSERT INTO ip_intelligence
      (ip, org_name, country, asn, looked_up_at, first_seen, last_seen, hit_count)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1)

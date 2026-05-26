@@ -27,7 +27,7 @@ pub struct Ipv4Packet {
 }
 
 impl Ipv4Packet {
-    pub fn parse(data: &[u8]) -> Option<Ipv4Packet> {
+    pub fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 20 {
             return None;
         }
