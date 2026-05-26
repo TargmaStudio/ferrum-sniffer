@@ -1,8 +1,8 @@
+use anyhow::Result;
+use serde::Deserialize;
+use sqlx::SqlitePool;
 use std::time;
 use std::time::SystemTime;
-use anyhow::Result;
-use sqlx::SqlitePool;
-use serde::Deserialize;
 
 #[derive(Clone)]
 pub struct PacketRecord {
@@ -67,7 +67,7 @@ impl Store {
                     first_seen   INTEGER NOT NULL,
                     last_seen    INTEGER NOT NULL,
                     hit_count    INTEGER NOT NULL DEFAULT 0
-                )"
+                )",
         )
         .execute(&pool)
         .await?;
@@ -125,58 +125,66 @@ impl Store {
             .as_secs() as i64;
 
         // Check cache first
-        let cached = sqlx::query("
+        let cached = sqlx::query(
+            "
             SELECT looked_up_at FROM ip_intelligence
-            WHERE ip = ? AND looked_up_at > ?"
+            WHERE ip = ? AND looked_up_at > ?",
         )
         .bind(ip)
-        .bind(now - (7 *86400))
+        .bind(now - (7 * 86400))
         .fetch_optional(&self.pool)
         .await?;
 
         if cached.is_some() {
             // Cache hit - just update the hit count and last_seen
-            sqlx::query("
+            sqlx::query(
+                "
                 UPDATE ip_intelligence
                 SET hit_count = hit_count + 1,
                     last_seen = ?
                 WHERE ip = ?
-            ")
+            ",
+            )
             .bind(now)
             .bind(ip)
             .execute(&self.pool)
             .await?;
 
-            return Ok(())
+            return Ok(());
         }
 
         // cache miss — hit the API
         let url = format!("http://ip-api.com/json/{}", ip);
-        let response = reqwest::get(&url)
-            .await?
-            .json::<IpApiResponse>()
-            .await?;
+        let response = reqwest::get(&url).await?.json::<IpApiResponse>().await?;
 
         // upsert — insert or update if exists
-        sqlx::query(
+        let (asn, org_name) = match &response.org {
+            Some(org) => parse_org_and_asn(org),
+            None => (None, None),
+        };
+
+        let result = sqlx::query(
             "INSERT INTO ip_intelligence
-         (ip, org_name, country, looked_up_at, first_seen, last_seen, hit_count)
-         VALUES (?, ?, ?, ?, ?, ?, 1)
-         ON CONFLICT(ip) DO UPDATE SET
-             org_name     = excluded.org_name,
-             country      = excluded.country,
-             looked_up_at = excluded.looked_up_at,
-             last_seen    = excluded.last_seen,
-             hit_count    = hit_count + 1"
+     (ip, org_name, country, asn, looked_up_at, first_seen, last_seen, hit_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+     ON CONFLICT(ip) DO UPDATE SET
+         org_name     = excluded.org_name,
+         country      = excluded.country,
+         asn          = excluded.asn,
+         looked_up_at = excluded.looked_up_at,
+         last_seen    = excluded.last_seen,
+         hit_count    = hit_count + 1",
         )
-            .bind(&response.ip)
-            .bind(&response.org)
-            .bind(&response.country)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
+        .bind(&response.ip) // ip
+        .bind(&org_name) // org_name
+        .bind(&response.country) // country
+        .bind(&asn) // asn
+        .bind(now) // looked_up_at
+        .bind(now) // first_seen
+        .bind(now) // last_seen
+        // hit_count = 1 hardcoded
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -184,20 +192,34 @@ impl Store {
 
 fn is_private_ip(ip: &str) -> bool {
     ip.starts_with("192.168.")
-    || ip.starts_with("10.")
-    || ip.starts_with("127.")
-    || ip.starts_with("169.254.")
-    || ip.starts_with("::1")
-    || {
-        // 172.16.0.0 - 172.31.255.255
-        if let Some(second) = ip.strip_prefix("172.") {
-            if let Some(num) = second.split(".").next() {
-                if let Ok(n) = num.parse::<u8>() {
-                    return n >= 16 && n <= 31;
+        || ip.starts_with("10.")
+        || ip.starts_with("127.")
+        || ip.starts_with("169.254.")
+        || ip.starts_with("::1")
+        || {
+            // 172.16.0.0 - 172.31.255.255
+            if let Some(second) = ip.strip_prefix("172.") {
+                if let Some(num) = second.split(".").next() {
+                    if let Ok(n) = num.parse::<u8>() {
+                        return n >= 16 && n <= 31;
+                    }
                 }
             }
-        }
 
-        false
+            false
+        }
+}
+
+fn parse_org_and_asn(org: &str) -> (Option<String>, Option<String>) {
+    // Check if the org starts with AS followed by numbers
+    if let Some(rest) = org.strip_prefix("AS") {
+        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+        if parts.len() == 2 {
+            if parts[0].chars().all(|c| c.is_numeric()) {
+                return (Some(format!("AS{}", parts[0])), Some(parts[1].to_string()));
+            }
+        }
     }
+
+    (None, Some(org.to_string()))
 }

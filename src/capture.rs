@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use anyhow::{Context, Result};
 use pcap::{Capture, Device};
 use tokio::task::{JoinSet};
@@ -35,6 +36,7 @@ pub fn default_interface() -> Result<String> {
 }
 
 pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
+    let mut seen_ips: HashSet<String> = HashSet::new();
     let mut tasks: JoinSet<()> = JoinSet::new();
     let store = Store::new("sqlite://ferrum.db?mode=rwc").await?;
     let mut cap = Capture::from_device(interface)
@@ -77,7 +79,13 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                                             length: transport.len() as u16
                                         };
                                         store.insert_packet(&record).await?;
-                                        spawn_ip_lookup(&mut tasks, &store, Ipv4Packet::format_ip(&ip.source), Ipv4Packet::format_ip(&ip.destination));
+                                        let src = Ipv4Packet::format_ip(&ip.source);
+                                        let dst = Ipv4Packet::format_ip(&ip.destination);
+                                        let src_new = seen_ips.insert(src.clone());
+                                        let dst_new = seen_ips.insert(dst.clone());
+                                        if src_new || dst_new {
+                                            spawn_ip_lookup(&mut tasks, &store, src, dst);
+                                        }
 
                                         println!(
                                             "#{} {}:{} -> {}:{} [{}] seq={} ack={} win={}",
@@ -105,7 +113,13 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                                             length:   udp.length,
                                         };
                                         store.insert_packet(&record).await?;
-                                        spawn_ip_lookup(&mut tasks, &store, Ipv4Packet::format_ip(&ip.source), Ipv4Packet::format_ip(&ip.destination));
+                                        let src = Ipv4Packet::format_ip(&ip.source);
+                                        let dst = Ipv4Packet::format_ip(&ip.destination);
+                                        let src_new = seen_ips.insert(src.clone());
+                                        let dst_new = seen_ips.insert(dst.clone());
+                                        if src_new || dst_new {
+                                            spawn_ip_lookup(&mut tasks, &store, src, dst);
+                                        }
 
                                         println!(
                                             "#{} {}:{} -> {}:{} [UDP] len={}",
@@ -138,12 +152,13 @@ pub async fn start(interface: &str, count: usize, filter: &str) -> Result<()> {
                                           icmp.code,
                                       );
 
-                                      spawn_ip_lookup(
-                                          &mut tasks,
-                                          &store,
-                                          Ipv4Packet::format_ip(&ip.source),
-                                          Ipv4Packet::format_ip(&ip.destination),
-                                      );
+                                      let src = Ipv4Packet::format_ip(&ip.source);
+                                      let dst = Ipv4Packet::format_ip(&ip.destination);
+                                      let src_new = seen_ips.insert(src.clone());
+                                      let dst_new = seen_ips.insert(dst.clone());
+                                      if src_new || dst_new {
+                                          spawn_ip_lookup(&mut tasks, &store, src, dst);
+                                      }
                                   }
                                 },
                                 _ => {}
